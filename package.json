@@ -1,0 +1,28 @@
+{
+  "name": "epic-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Grounded documentation assistant for devdocs.epiccash.com, backed by Claude on Amazon Bedrock in eu-central-1.",
+  "engines": {
+    "node": ">=22.0"
+  },
+  "scripts": {
+    "corpus": "node build-corpus.mjs",
+    "scan": "node build-corpus.mjs --scan-only",
+    "stats": "node build-corpus.mjs --stats",
+    "serve": "node server.mjs",
+    "preview": "node preview.mjs",
+    "dev": "node dev-server.mjs",
+    "test": "node test-guards.mjs && node test-retrieval.mjs",
+    "test:guards": "node test-guards.mjs",
+    "test:retrieval": "node test-retrieval.mjs",
+    "test:stream": "node test-stream.mjs",
+    "test:server": "node test-server.mjs",
+    "eval": "node eval.mjs",
+    "gaps": "node gaps.mjs"
+  },
+  "dependencies": {
+    "minisearch": "7.2.0"
+  }
+}

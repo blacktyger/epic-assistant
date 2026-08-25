@@ -1,0 +1,10 @@
+node_modules/
+
+# Generated from the rendered docs site by `npm run corpus`. Reproducible, and large, so it is not
+# committed. CI rebuilds it after building the site.
+dist/
+
+# Runtime state, written by the server. The spend ledger is durable across restarts by design, so it
+# lives on disk, but it is machine-local and not source.
+var/
+*.log

@@ -16,6 +16,10 @@
  * Streaming is SSE over a POST, read with fetch and a ReadableStream on the client. EventSource is not
  * usable: it is GET-only and cannot carry a request body, and the workarounds all cost a round trip or
  * a URL-length ceiling.
+ *
+ * One answer may now take several Bedrock calls rather than one, because the model can ask for live
+ * chain or GitHub data mid-turn. `generate` owns that loop and is the only place it exists; every gate
+ * above it still runs exactly once per reader request.
  */
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -25,16 +29,21 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import {
   server as serverCfg, model as modelCfg, request as requestCfg, retrieval as retrievalCfg,
-  spend as spendCfg, session as sessionLimits, resolveModel, costOf, MODELS,
+  spend as spendCfg, session as sessionLimits, tools as toolCfg,
+  resolveModel, resolvePublicModel, publicModelChoices, reserveFor, costOf, MODELS,
 } from './config.mjs';
 import { loadCredentials, converseStream, BedrockStreamError } from './lib/bedrock.mjs';
 import { loadRetriever, retrieve, renderDocuments } from './lib/retrieve.mjs';
-import { buildPrompt, retrievalQuery, CANARY } from './lib/prompt.mjs';
+import { buildPrompt, buildToolResultTurn, retrievalQuery, CANARY } from './lib/prompt.mjs';
 import { SpendLedger } from './lib/ledger.mjs';
 import { SessionStore, ipKey } from './lib/limits.mjs';
 import { OutputGuard, extractCitations, buildCitationIndex } from './lib/guard.mjs';
 import { QuestionLog } from './lib/log.mjs';
 import { AnswerCache } from './lib/answer-cache.mjs';
+import {
+  buildToolConfig, runTool, labelFor, toolGroupFor, availableToolNames, toolStats, sweepToolCaches,
+  ToolBudget,
+} from './lib/tools/index.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -65,12 +74,24 @@ const fullCorpusDocuments = retrievalCfg.fullCorpus
   ? renderDocuments(corpus.sections)
   : null;
 
+/**
+ * Built once at startup, not per request.
+ *
+ * The schemas are identical on every call and they sit in the cached prompt prefix, so rebuilding them
+ * per request would be pure waste. It also means a change to tool availability needs a restart, which
+ * is correct: the availability of a node endpoint is a deployment fact, and a prefix that varies
+ * between requests would defeat prompt caching.
+ */
+const toolConfig = buildToolConfig();
+const toolsOffered = Boolean(toolConfig);
+
 let inFlight = 0;
 
 setInterval(() => {
   sessions.sweep();
   ledger.prune();
   questionLog.prune();
+  sweepToolCaches();
 }, 3_600_000).unref();
 
 /* ------------------------------------------------------------------ helpers */
@@ -205,6 +226,16 @@ const routes = {
         maxRequests: sessionLimits.maxRequests,
         maxTurns: requestCfg.maxTurns,
       },
+      /*
+       * The picker's contents come from the server rather than being hard-coded in the panel.
+       *
+       * Not tidiness. The allowlist that decides which model a request may name lives here, so a panel
+       * with its own list would offer a choice the server rejects the moment the two drift. This way
+       * the only way to add a model to the picker is to add it to the allowlist.
+       */
+      models: publicModelChoices(),
+      /** Lets the panel say the assistant can check live data, without hard-coding that it can. */
+      liveData: toolsOffered,
     });
   },
 
@@ -213,9 +244,11 @@ const routes = {
       ok: ledger.state === 'open',
       corpus: { version: corpus.version, sections: corpus.sections.length },
       model: resolveModel(modelCfg.default),
+      models: publicModelChoices(),
       spend: ledger.snapshot,
       sessions: sessions.stats,
       answerCache: answers.stats,
+      tools: toolStats(),
       inFlight,
     });
   },
@@ -285,13 +318,25 @@ async function handleChat(req, res) {
     return;
   }
 
-  /* --- gate 8: model selection, admin-gated */
-  let modelId = resolveModel(modelCfg.default);
+  /* --- gate 8: model selection */
+  /*
+   * Two paths, and the distinction is who is paying for what.
+   *
+   * A reader may name anything in `model.publicChoices`, which is the picker in the panel. That is a
+   * deliberate reversal: the choice used to be admin-only to stop a caller reaching for the expensive
+   * model, but Opus 4.6 is 1.67x Sonnet 4.6 rather than an order of magnitude, and the daily ledger
+   * bounds the total either way. Withholding it cost the feature readers of a coding assistant expect.
+   *
+   * The header path still exists and is still gated, and now that is its whole purpose: reaching a
+   * model outside the public list, for evaluation runs.
+   */
+  let modelId;
+  let modelKey;
   const requestedModel = req.headers[modelCfg.overrideHeader];
   if (requestedModel) {
     if (!isAdmin(req)) {
       releaseIpSlot();
-      return json(res, 403, { error: 'model override requires an admin token' });
+      return json(res, 403, { error: 'that header requires an admin token; use the model field in the body' });
     }
     const picked = resolveModel(String(requestedModel));
     if (!picked) {
@@ -299,6 +344,15 @@ async function handleChat(req, res) {
       return json(res, 400, { error: `unknown model, allowed: ${Object.keys(MODELS).join(', ')}` });
     }
     modelId = picked;
+    modelKey = String(requestedModel);
+  } else {
+    const chosen = resolvePublicModel(body.model);
+    if (!chosen.ok) {
+      releaseIpSlot();
+      return json(res, 400, { error: chosen.reason });
+    }
+    modelId = chosen.modelId;
+    modelKey = chosen.id;
   }
 
   /* --- gate 9: answer cache, before the ledger so a hit costs nothing and is never blocked */
@@ -311,7 +365,10 @@ async function handleChat(req, res) {
   if (cached) {
     ledger.recordCachedAnswer();
     const stream = openStream(res);
-    stream.send('start', { cached: true, model: modelId, retrieved: cached.retrieved ?? 0, sources: cached.sources ?? [] });
+    stream.send('start', {
+      cached: true, model: modelId, modelKey,
+      retrieved: cached.retrieved ?? 0, sources: cached.sources ?? [],
+    });
     stream.send('text', { text: cached.text });
     if (cached.citations?.length) stream.send('citations', { citations: cached.citations });
     // Same shape as the generated path, so the panel has no cached-versus-live special case.
@@ -332,7 +389,14 @@ async function handleChat(req, res) {
   }
 
   /* --- gate 10: daily spend */
-  const budget = ledger.check();
+  /*
+   * The reservation is derived rather than fixed, because the spread between the cheapest and dearest
+   * request on this endpoint is now about 5x: a Sonnet lookup against one retrieval pass versus an Opus
+   * answer that spends all three tool rounds re-sending an accumulating transcript. A flat reserve
+   * either under-protects the expensive case or refuses the cheap one long before the cap.
+   */
+  const reserveUsd = reserveFor(modelId, { toolRounds: toolsOffered ? toolCfg.maxRounds : 1 });
+  const budget = ledger.check(reserveUsd);
   if (!budget.allowed) {
     releaseIpSlot();
     const stream = openStream(res);
@@ -361,7 +425,7 @@ async function handleChat(req, res) {
 
   /* --- everything below costs money */
   inFlight += 1;
-  const releaseReservation = ledger.reserve();
+  const releaseReservation = ledger.reserve(reserveUsd);
   const stream = openStream(res);
   const abort = new AbortController();
   let finished = false;
@@ -375,6 +439,9 @@ async function handleChat(req, res) {
    * rest of the exchange. The response's 'close' fires both on normal completion and on a premature
    * connection teardown, which is why the `finished` flag distinguishes them: without it, the
    * end-of-stream close would abort a generation that had already succeeded.
+   *
+   * The same signal is handed to the tool layer, so an abandoned answer also abandons the node request
+   * it was waiting on.
    */
   res.on('close', () => {
     if (!finished) abort.abort();
@@ -383,11 +450,37 @@ async function handleChat(req, res) {
 
   const history = normaliseHistory(body.history);
   const guard = new OutputGuard({ canary: CANARY });
+  const toolBudget = new ToolBudget();
 
+  /**
+   * Usage is summed across rounds rather than replaced.
+   *
+   * Each Bedrock call reports its own usage block, so keeping only the last one would under-report a
+   * three-round answer by roughly two thirds. This is the number the ledger and the session quota both
+   * read, so getting it wrong silently widens both budgets.
+   */
   let usage = null;
   let stopReason = null;
   let errorKind = null;
   let retrieved = { sections: [], tokensApprox: 0 };
+
+  /**
+   * Bills the accumulated usage exactly once, whichever way the request ends.
+   *
+   * There are now three exits: a completed answer, a guard abort mid-stream, and a thrown error. All
+   * three may follow rounds Bedrock has already billed for, and the previous shape recorded on only
+   * the first of them. That is the direction of mistake that matters, because a guard abort and a
+   * throw are the cases most likely to repeat, so the unrecorded spend would compound exactly when
+   * the daily cap was the only thing left protecting the account.
+   */
+  let recorded = false;
+  const settleUsage = () => {
+    if (recorded || !usage) return 0;
+    recorded = true;
+    const usd = ledger.record({ modelId, usage, ttl: modelCfg.cacheTtl });
+    sessions.recordUsage(verified.sid, usage);
+    return usd;
+  };
 
   try {
     if (fullCorpusDocuments) {
@@ -406,34 +499,114 @@ async function handleChat(req, res) {
       history,
       question,
       cacheTtl: modelCfg.cacheTtl,
+      tools: toolsOffered,
     });
 
     stream.send('start', {
       model: modelId,
+      modelKey,
+      liveData: toolsOffered,
       retrieved: retrieved.sections.length,
       sources: retrieved.sections.slice(0, 8).map((s) => ({
         url: s.url, title: s.heading ?? s.pageTitle, breadcrumb: s.breadcrumb,
       })),
     });
 
-    for await (const ev of converseStream({
-      credentials, modelId, system, messages,
-      maxTokens: modelCfg.maxTokens,
-      temperature: modelCfg.temperature,
-      signal: abort.signal,
-    })) {
-      if (ev.type === 'text') {
-        const { emit, abort: abortReason } = guard.push(ev.text);
-        if (abortReason) {
-          errorKind = abortReason;
-          abort.abort();
-          break;
+    /*
+     * The tool loop.
+     *
+     * Each pass streams one assistant turn. If it ends with `tool_use`, the requested calls are run,
+     * their results are appended as the next user turn, and the loop goes round again. Anything else
+     * ends the answer.
+     *
+     * Three properties worth stating because they are easy to lose:
+     *
+     * - Text streams to the reader on every pass, not only the last. A model that says "let me check
+     *   the current height" before calling a tool has said something useful, and holding it back to
+     *   see whether more rounds follow would make the panel look stalled for the length of a node
+     *   request.
+     * - The assistant turn is replayed from `ev.content`, the blocks Bedrock actually sent, not
+     *   rebuilt from the text we happened to keep. A toolResult whose toolUseId is absent from the
+     *   preceding assistant message is a validation error, not a degraded answer.
+     * - The loop is bounded by round count, not by whether progress is being made. A model that asks
+     *   for the same tool three times gets three cached results and then has to answer, which is a
+     *   worse answer but a bounded bill.
+     */
+    for (let round = 0; round < toolCfg.maxRounds; round += 1) {
+      toolBudget.spendRound();
+
+      /** Tool calls requested during this pass, run after the stream closes rather than during it. */
+      const requested = [];
+      let roundContent = [];
+
+      for await (const ev of converseStream({
+        credentials, modelId, system, messages,
+        maxTokens: modelCfg.maxTokens,
+        temperature: modelCfg.temperature,
+        // Withheld on the final permitted round. Offering tools the loop has no room to answer
+        // produces a turn that stops at `tool_use` with nothing after it, and the reader gets a
+        // half-sentence. Removing them forces the model to finish with what it has.
+        toolConfig: toolsOffered && round < toolCfg.maxRounds - 1 ? toolConfig : undefined,
+        signal: abort.signal,
+      })) {
+        if (ev.type === 'text') {
+          const { emit, abort: abortReason } = guard.push(ev.text);
+          if (abortReason) {
+            errorKind = abortReason;
+            abort.abort();
+            break;
+          }
+          if (emit) stream.send('text', { text: emit });
+        } else if (ev.type === 'toolUse') {
+          requested.push(ev);
+        } else if (ev.type === 'done') {
+          usage = addUsage(usage, ev.usage);
+          stopReason = ev.stopReason;
+          roundContent = ev.content;
         }
-        if (emit) stream.send('text', { text: emit });
-      } else if (ev.type === 'done') {
-        usage = ev.usage;
-        stopReason = ev.stopReason;
       }
+
+      if (errorKind) break;
+      if (stopReason !== 'tool_use' || !requested.length) break;
+
+      /*
+       * Told to the reader before the calls run, not after.
+       *
+       * A node request plus a GitHub request is a second or two of silence in the middle of an answer,
+       * and silence in a chat interface reads as a hang. The label is written per tool in the registry
+       * so the panel can say "Checking the live Epic chain" rather than "running tool".
+       */
+      stream.send('tool', {
+        phase: 'start',
+        calls: requested.map((r) => ({
+          name: r.name,
+          group: toolGroupFor(r.name),
+          label: labelFor(r.name, r.input),
+        })),
+      });
+
+      const results = [];
+      for (const call of requested) {
+        // Sequential, not parallel. Two calls per round is the realistic maximum, both are usually
+        // cache hits, and serialising keeps our load on the node predictable rather than bursty.
+        const outcome = call.parseError
+          ? { ok: false, tool: call.name, data: { error: call.parseError }, ms: 0 }
+          : await runTool(call.name, call.input, { signal: abort.signal, budget: toolBudget });
+        results.push({ ...outcome, toolUseId: call.toolUseId, name: call.name });
+      }
+
+      stream.send('tool', {
+        phase: 'done',
+        calls: results.map((r) => ({
+          name: r.name,
+          group: toolGroupFor(r.name),
+          ok: r.ok,
+          ms: r.ms,
+        })),
+      });
+
+      messages.push({ role: 'assistant', content: roundContent });
+      messages.push(buildToolResultTurn(results));
     }
 
     if (!errorKind) {
@@ -443,24 +616,37 @@ async function handleChat(req, res) {
       const { citations, invalid } = extractCitations(guard.text, citationIndex);
       if (citations.length) stream.send('citations', { citations });
 
-      const usd = usage ? ledger.record({ modelId, usage, ttl: modelCfg.cacheTtl }) : 0;
-      sessions.recordUsage(verified.sid, usage);
+      const usd = settleUsage();
 
       const refused = looksLikeRefusal(guard.text);
-      answers.set(question, modelId, {
-        text: guard.text,
-        citations,
-        refused,
-        // Carried so a cache hit can reproduce the same start event as a live generation.
-        retrieved: retrieved.sections.length,
-        sources: retrieved.sections.slice(0, 8).map((s) => ({
-          url: s.url, title: s.heading ?? s.pageTitle, breadcrumb: s.breadcrumb,
-        })),
-      });
+      const usedTools = toolBudget.calls > 0;
+
+      /*
+       * An answer built on live data is not cached.
+       *
+       * The answer cache has a 24-hour TTL, which is correct for "what is coinbase maturity" and wrong
+       * by 1,440 blocks for "what is the current height". Caching a live answer would be worse than
+       * having no live data at all, because it would report a stale figure with the confidence of a
+       * fresh one. The tool layer's own short TTLs already remove the repeated cost, so what is lost
+       * here is small.
+       */
+      if (!usedTools) {
+        answers.set(question, modelId, {
+          text: guard.text,
+          citations,
+          refused,
+          // Carried so a cache hit can reproduce the same start event as a live generation.
+          retrieved: retrieved.sections.length,
+          sources: retrieved.sections.slice(0, 8).map((s) => ({
+            url: s.url, title: s.heading ?? s.pageTitle, breadcrumb: s.breadcrumb,
+          })),
+        });
+      }
 
       stream.send('done', {
         stopReason,
         citations: citations.length,
+        liveData: usedTools,
         remaining: sessions.checkSession(verified.sid).remaining,
       });
 
@@ -474,10 +660,12 @@ async function handleChat(req, res) {
         retrievedSections: retrieved.sections.length,
         retrievedTokens: retrieved.tokensApprox,
         cacheHit: usage ? usage.cacheReadInputTokens > 0 : null,
+        tools: toolBudget.summary,
         usage, usd, stopReason,
         ms: Date.now() - started,
       });
     } else {
+      settleUsage();
       stream.send('error', {
         kind: errorKind,
         message: 'The answer was stopped by a safety check. Please rephrase, or use the search box.',
@@ -485,7 +673,8 @@ async function handleChat(req, res) {
       });
       questionLog.write({
         sid: verified.sid, ipHash: hashIp(ip), question, model: modelId,
-        guardFindings: guard.findings, error: errorKind, ms: Date.now() - started,
+        guardFindings: guard.findings, tools: toolBudget.summary,
+        error: errorKind, ms: Date.now() - started,
       });
     }
   } catch (err) {
@@ -503,9 +692,18 @@ async function handleChat(req, res) {
       console.error(`[chat] ${kind}: ${err?.message}`);
       questionLog.write({
         sid: verified.sid, ipHash: hashIp(ip), question, model: modelId,
-        error: kind, ms: Date.now() - started,
+        error: kind, tools: toolBudget.summary, ms: Date.now() - started,
       });
     }
+
+    /*
+     * Usage from rounds that completed before the failure is still recorded.
+     *
+     * Bedrock billed for them whether or not the answer arrived, so skipping this on the error path
+     * would let a request that failed on its third round spend two rounds' worth of budget invisibly.
+     * A repeated failure is exactly when the ledger most needs to be right.
+     */
+    settleUsage();
   } finally {
     finished = true;
     clearTimeout(timeout);
@@ -518,8 +716,26 @@ async function handleChat(req, res) {
 
 /* ------------------------------------------------------------------ small helpers */
 
-function normaliseHistory(raw) {
-  if (!Array.isArray(raw)) return [];
+/**
+ * Sums the usage blocks from every round of one answer.
+ *
+ * Bedrock reports usage per call, so a three-round answer arrives as three blocks. Cache reads are
+ * summed alongside the rest and that is correct rather than surprising: the cached prefix is read once
+ * per round, so a three-round answer genuinely pays three cache reads, at a tenth of input price each.
+ */
+function addUsage(into, next) {
+  if (!next) return into;
+  if (!into) return { ...next };
+  return {
+    inputTokens: into.inputTokens + next.inputTokens,
+    outputTokens: into.outputTokens + next.outputTokens,
+    cacheReadInputTokens: into.cacheReadInputTokens + next.cacheReadInputTokens,
+    cacheWriteInputTokens: into.cacheWriteInputTokens + next.cacheWriteInputTokens,
+    totalTokens: (into.totalTokens ?? 0) + (next.totalTokens ?? 0),
+  };
+}
+
+function normaliseHistory(raw) {  if (!Array.isArray(raw)) return [];
   return raw
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string')
     .slice(-requestCfg.maxTurns * 2)
@@ -676,8 +892,19 @@ const httpServer = createServer(async (req, res) => {
 httpServer.listen(serverCfg.port, serverCfg.host, () => {
   console.log(`epic-assistant on http://${serverCfg.host}:${serverCfg.port}`);
   console.log(`  model    ${resolveModel(modelCfg.default)}`);
+  console.log(`  picker   ${publicModelChoices().choices.map((m) => m.id).join(', ') || 'none'}`);
   console.log(`  corpus   ${corpus.sections.length} sections, built ${corpus.version}`);
   console.log(`  retrieval topK=${retrievalCfg.topK}${retrievalCfg.fullCorpus ? ' (FULL CORPUS MODE)' : ''}`);
+  /*
+   * Printed at startup because the failure mode is silent. A missing EPIC_NODE_URL or node secret
+   * leaves the chain tools out of `toolConfig`, the model never mentions them, and every live question
+   * gets a documentation answer that looks entirely reasonable. Naming what is offered turns that into
+   * something visible on the first line of the log.
+   */
+  const t = toolStats();
+  console.log(`  tools    ${availableToolNames().join(', ') || 'none'}`);
+  console.log(`           chain ${t.node.available ? 'ready' : 'unavailable, check EPIC_NODE_URL and EPIC_NODE_API_SECRET'}`);
+  console.log(`           github ${t.github.available ? t.github.repos.join(', ') : 'unavailable'}${t.github.rate.authenticated ? '' : ' (unauthenticated, 60 requests per hour)'}`);
   console.log(`  spend    $${ledger.usd.toFixed(4)} today, soft $${spendCfg.softDailyUsd}, hard $${spendCfg.hardDailyUsd}, state ${ledger.state}`);
   if (STATIC_DIR) {
     console.log(`  static   serving ${STATIC_DIR}`);

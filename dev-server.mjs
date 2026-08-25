@@ -31,7 +31,7 @@ process.env.EPIC_AI_ADMIN_TOKEN = process.env.EPIC_AI_ADMIN_TOKEN ?? 'dev-admin-
  * `npm run build`, so a page added since then will not appear in keyword results even though the
  * page itself hot-reloads. The modal says so.
  */
-process.env.EPIC_AI_STATIC_DIR = process.env.EPIC_AI_STATIC_DIR ?? '../epic-devdocs/site/build';
+process.env.EPIC_AI_STATIC_DIR = process.env.EPIC_AI_STATIC_DIR ?? '../devdocs-public/site/build';
 
 console.log(`dev launcher: pid ${process.pid}, port ${port}`);
 console.log(`stop with: Stop-Process -Id ${process.pid}`);

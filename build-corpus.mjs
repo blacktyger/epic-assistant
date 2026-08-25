@@ -2,7 +2,7 @@
 /**
  * Builds the assistant corpus from the rendered docs site.
  *
- * Run after `npm run build` in ../devdocs-public/site, because this reads the build output rather than
+ * Run after `npm run build` in ../epic-devhub/site, because this reads the build output rather than
  * the MDX source. Emits, into dist/:
  *
  *   corpus.json      sections with breadcrumbs, anchors and a prebuilt minisearch index
@@ -23,7 +23,7 @@ import { scanSections } from './lib/scan.mjs';
 import { buildCore, buildGlossary, readVersions } from './lib/core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SITE = join(HERE, '..', 'devdocs-public', 'site');
+const SITE = join(HERE, '..', 'epic-devhub', 'site');
 const BUILD = join(SITE, 'build');
 const DIST = join(HERE, 'dist');
 const ORIGIN = 'https://devdocs.epiccash.com';
@@ -45,7 +45,7 @@ const COMMUNITY = [
 ];
 
 if (!existsSync(BUILD)) {
-  console.error(`No build output at ${BUILD}\nRun \`npm run build\` in devdocs-public/site first.`);
+  console.error(`No build output at ${BUILD}\nRun \`npm run build\` in epic-devhub/site first.`);
   process.exit(1);
 }
 

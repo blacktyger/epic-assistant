@@ -21,6 +21,7 @@ import MiniSearch from 'minisearch';
 import { articleToText, splitSections, decodeEntities } from './lib/extract.mjs';
 import { scanSections } from './lib/scan.mjs';
 import { buildCore, buildGlossary, readVersions } from './lib/core.mjs';
+import { locale as localeCfg, localeKeys } from './config.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SITE = join(HERE, '..', 'epic-devhub', 'site');
@@ -60,7 +61,31 @@ const pageFiles = [];
   }
 })(BUILD);
 
-const SKIP_ROUTES = [/^404/, /^search/];
+/*
+ * Routes that never become corpus sections.
+ *
+ * The locale prefixes are the load-bearing entries. This walks the whole build tree, which since the
+ * translations landed holds 141 index.html files where 47 are English, so without them a run would
+ * silently triple the section count, mix three languages into one MiniSearch index, and start emitting
+ * translated URLs as citations. Retrieval is locale-blind: one index, English tokens, no per-locale
+ * selection. So the corpus is deliberately the source locale only, and a non-English reader gets
+ * English sources retrieved and an answer written in their language, which is the arrangement
+ * lib/prompt.mjs is built for.
+ *
+ * Generated from the locale list rather than written out, because the failure mode of forgetting to add
+ * a new locale here is a corpus that quietly grows a second copy of every page.
+ *
+ * Making this per-locale later means building one index per locale and selecting on the request's
+ * locale. That is a real feature with real cost, not a config change, which is why this is a filter and
+ * not a flag.
+ */
+const SKIP_ROUTES = [
+  /^404/,
+  /^search/,
+  ...localeKeys()
+    .filter((key) => key !== localeCfg.default)
+    .map((key) => new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|$)`)),
+];
 
 const pages = [];
 const sections = [];

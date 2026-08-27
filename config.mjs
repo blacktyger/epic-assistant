@@ -487,6 +487,53 @@ export const logging = {
   retentionDays: num('EPIC_AI_LOG_RETENTION_DAYS', 30),
 };
 
+/* ----------------------------------------------------------------- locales */
+
+/**
+ * The locales this service will answer in, and the English name of each language as the prompt has to
+ * phrase it.
+ *
+ * The literal is here rather than read from `locales.json` at the workspace root for the same reason
+ * the port below is: only this directory is deployed, and a service that cannot start without a file
+ * from a sibling directory is a new way for the deployment to break.
+ * `node tools/locales.mjs check` compares the two, so drift is caught in the repository instead of by
+ * a reader getting an answer in the wrong language.
+ *
+ * This is the service's only locale declaration. It used to be four: a Set in server.mjs, the prose of
+ * the 400 message beside it, a regex inside validPagePath, and this map in lib/prompt.mjs. Three of
+ * those four fail quietly when a locale is added to only some of them, and the loudest symptom of the
+ * fourth is an answer in English that nobody reports as a bug.
+ *
+ * Not environment-overridable on purpose. A locale the site does not build is a locale whose citations
+ * point at pages that do not exist, so this is a deployment fact rather than a knob.
+ */
+export const locale = {
+  default: 'en',
+
+  /*
+   * Keys are quoted, including the ones that do not need it. They are data that an external checker
+   * greps for, not identifiers, and an unquoted `ru:` is invisible to that check while a bare
+   * substring search for "en" matches almost any English sentence in this file. Quoting all three is
+   * what makes `node tools/locales.mjs check` able to tell present from absent.
+   */
+  answerLanguage: {
+    'en': 'English',
+    'ru': 'Russian',
+    'zh-CN': 'Simplified Chinese',
+  },
+};
+
+/** Every locale key, for a generated error message or a generated route pattern. */
+export const localeKeys = () => Object.keys(locale.answerLanguage);
+
+/** Exact, case-sensitive membership. `zh-cn` is not `zh-CN`, and guessing which was meant is worse. */
+export const isSupportedLocale = (value) =>
+  typeof value === 'string' && Object.hasOwn(locale.answerLanguage, value);
+
+/** The language name to instruct the model with, falling back to the default locale's. */
+export const answerLanguageOf = (value) =>
+  locale.answerLanguage[value] ?? locale.answerLanguage[locale.default];
+
 /* ------------------------------------------------------------------ server */
 
 export const server = {

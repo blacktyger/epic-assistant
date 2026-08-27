@@ -287,7 +287,7 @@ group('prompt assembly with tools');
 
   const prompt = buildPrompt({ core: 'c', documents: '<documents/>', question: 'how tall', tools: true });
   ok('the cache point sits after the instructions', prompt.system[1].cachePoint !== undefined);
-  ok('documents land after the cache point', prompt.system.length === 3);
+  ok('page context and documents land after the cache point', prompt.system.length === 4);
   ok('the tool-aware reminder is used', /check the live chain/i.test(prompt.messages.at(-1).content[0].text));
 
   const plain = buildPrompt({ core: 'c', documents: '<documents/>', question: 'how tall', tools: false });

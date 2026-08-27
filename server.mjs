@@ -30,6 +30,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import {
   server as serverCfg, model as modelCfg, request as requestCfg, retrieval as retrievalCfg,
   spend as spendCfg, session as sessionLimits, tools as toolCfg,
+  locale as localeCfg, localeKeys, isSupportedLocale,
   resolveModel, resolvePublicModel, publicModelChoices, reserveFor, costOf, MODELS,
 } from './config.mjs';
 import { loadCredentials, converseStream, BedrockStreamError } from './lib/bedrock.mjs';
@@ -302,6 +303,18 @@ async function handleChat(req, res) {
     });
   }
 
+  const locale = body.locale === undefined ? localeCfg.default : body.locale;
+  if (!isSupportedLocale(locale)) {
+    releaseIpSlot();
+    return json(res, 400, {error: `unsupported locale; choose ${localeKeys().join(', ')}`});
+  }
+
+  const pagePath = body.pagePath === undefined ? '/' : body.pagePath;
+  if (!validPagePath(pagePath)) {
+    releaseIpSlot();
+    return json(res, 400, {error: 'pagePath must be a site-relative documentation path'});
+  }
+
   /* --- gate 7: per-session budget */
   const sess = sessions.checkSession(verified.sid);
   if (!sess.allowed) {
@@ -361,7 +374,7 @@ async function handleChat(req, res) {
   // that, any caller could force a fresh generation on every request and defeat the cheapest cost
   // control in the service.
   const skipCache = Boolean(req.headers['x-epic-no-cache']) && isAdmin(req);
-  const cached = skipCache ? null : answers.get(question, modelId);
+  const cached = skipCache ? null : answers.get(question, modelId, locale, pagePath);
   if (cached) {
     ledger.recordCachedAnswer();
     const stream = openStream(res);
@@ -500,6 +513,8 @@ async function handleChat(req, res) {
       question,
       cacheTtl: modelCfg.cacheTtl,
       tools: toolsOffered,
+      locale,
+      pagePath,
     });
 
     stream.send('start', {
@@ -606,7 +621,7 @@ async function handleChat(req, res) {
       });
 
       messages.push({ role: 'assistant', content: roundContent });
-      messages.push(buildToolResultTurn(results));
+      messages.push(buildToolResultTurn(results, locale));
     }
 
     if (!errorKind) {
@@ -631,7 +646,7 @@ async function handleChat(req, res) {
        * here is small.
        */
       if (!usedTools) {
-        answers.set(question, modelId, {
+        answers.set(question, modelId, locale, pagePath, {
           text: guard.text,
           citations,
           refused,
@@ -655,7 +670,7 @@ async function handleChat(req, res) {
         refused,
         citations: citations.length,
         citationsInvalid: invalid.length,
-        followup: /(^|\n)\s*(Next:|Also worth knowing:)/.test(guard.text),
+        followup: /(^|\n)\s*(Next:|Also worth knowing:|Далее:|Также полезно знать:|下一步[：:]|另外值得了解[：:])/.test(guard.text),
         guardFindings: guard.findings,
         retrievedSections: retrieved.sections.length,
         retrievedTokens: retrieved.tokensApprox,
@@ -735,6 +750,26 @@ function addUsage(into, next) {
   };
 }
 
+/**
+ * A site-relative documentation path with no locale prefix.
+ *
+ * The locale is carried by the `locale` field, so a prefixed path here would mean the client sent the
+ * same fact twice and the answer cache would partition on it. The pattern is generated from the locale
+ * list rather than written out, because a hardcoded one silently stops rejecting a locale added later.
+ */
+function validPagePath(value) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 512) return false;
+  if (value !== '/' && !/^\/[A-Za-z0-9._~/-]+$/.test(value)) return false;
+  const segments = value.split('/');
+  if (value.includes('//') || segments.includes('.') || segments.includes('..')) return false;
+  return !LOCALE_PREFIX_RE.test(value);
+}
+
+/** `/^\/(?:en|ru|zh-CN)(?:\/|$)/`, built once from the locale list. */
+const LOCALE_PREFIX_RE = new RegExp(
+  `^/(?:${localeKeys().map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?:/|$)`,
+);
+
 function normaliseHistory(raw) {  if (!Array.isArray(raw)) return [];
   return raw
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string')
@@ -753,8 +788,10 @@ function normaliseHistory(raw) {  if (!Array.isArray(raw)) return [];
  * never "not in the corpus".
  */
 function looksLikeRefusal(text) {
-  return /\b(do(es)? not (cover|contain|describe|mention)|not in the (docs|documentation)|could not find|no section)\b/i
-    .test(text.slice(0, 400));
+  const head = text.slice(0, 400);
+  return /\b(do(es)? not (cover|contain|describe|mention)|not in the (docs|documentation)|could not find|no section)\b/i.test(head)
+    || /(не удалось найти|нет в документации|документац[^.]{0,40}не (описывает|содержит|упоминает))/i.test(head)
+    || /(文档.{0,30}(未提及|没有|找不到)|未在文档中找到)/.test(head);
 }
 
 function messageFor(kind) {

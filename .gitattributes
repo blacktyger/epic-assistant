@@ -1,0 +1,4 @@
+# Normalise line endings to LF regardless of the machine that committed. This service is developed
+# on Windows and Linux and deployed on Linux, so a file whose line endings depend on who checked it
+# out is a source of phantom diffs.
+* text=auto eol=lf
